@@ -31,6 +31,10 @@ cargo run -- --config config.toml --check
 
 GitHub Actions 的 **Build packages** 工作流会在向 `main` / `master` 推送、创建 `v*` 标签、提交 PR 或手动触发时运行。在 Actions 对应运行页面的 **Artifacts** 区域下载目标平台的包。
 
+推送 `v*` 标签时，六个平台全部构建成功后会自动创建对应的 GitHub Release，上传六个安装包及各自的 SHA256 校验文件，并自动生成发布说明。任一目标失败均不发布。对标签手动触发工作流也会发布；普通分支和 PR 仅生成 Artifacts。
+
+例如推送 `v0.1.0` 会创建同名正式版；`v0.2.0-rc.1` 等包含 `-` 的标签会标记为预发布。重跑同一标签会更新同名附件，保留已有 Release 的说明和发布状态。安装包文件名仍使用 `Cargo.toml` 中的版本号，打标签前应同步更新该版本。
+
 | 平台 | 架构 | Rust target | 包格式 |
 | --- | --- | --- | --- |
 | Linux musl | amd64 | `x86_64-unknown-linux-musl` | `.tar.gz` |

@@ -132,3 +132,32 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check out release script
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download all platform packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: socks-server-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify packages and publish release
+        shell: bash
+        run: bash .github/scripts/release.sh dist
