@@ -19,6 +19,7 @@ pub struct Config {
     pub max_connections: usize,
     pub auth: Auth,
     pub ip_filter: IpFilter,
+    pub udp: Udp,
     pub logging: Logging,
 }
 
@@ -32,6 +33,7 @@ impl Default for Config {
             max_connections: 1024,
             auth: Auth::default(),
             ip_filter: IpFilter::default(),
+            udp: Udp::default(),
             logging: Logging::default(),
         }
     }
@@ -80,6 +82,16 @@ impl Config {
         }
         if self.max_connections == 0 || self.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
             bail!("max_connections is outside the supported range");
+        }
+        if self.udp.idle_timeout_secs == 0 {
+            bail!("udp.idle_timeout_secs must be greater than zero");
+        }
+        if self.udp.public_ip.map(canonical_ip).is_some_and(|ip| {
+            ip.is_unspecified()
+                || ip.is_multicast()
+                || matches!(ip, IpAddr::V4(ip) if ip.is_broadcast())
+        }) {
+            bail!("udp.public_ip must be a unicast address");
         }
         if self.auth.enabled {
             for (name, value) in [
@@ -168,7 +180,7 @@ impl IpRule {
     }
 }
 
-fn canonical_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
         _ => ip,
@@ -181,6 +193,24 @@ impl IpFilter {
         !self.enabled
             || (!self.deny.iter().any(|rule| rule.contains(ip))
                 && self.allow.iter().any(|rule| rule.contains(ip)))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Udp {
+    pub enabled: bool,
+    pub public_ip: Option<IpAddr>,
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for Udp {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            public_ip: None,
+            idle_timeout_secs: 60,
+        }
     }
 }
 
@@ -267,6 +297,27 @@ mod tests {
         assert!(!config.auth.accepts("proxy", "wrong"));
         config.max_connections = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validates_udp_idle_timeout_and_advertised_address() {
+        let mut config = Config::default();
+        config.udp.idle_timeout_secs = 0;
+        assert!(config.validate().is_err());
+        config.udp.idle_timeout_secs = 60;
+        for ip in [
+            "0.0.0.0",
+            "::",
+            "::ffff:0.0.0.0",
+            "224.0.0.1",
+            "ff02::1",
+            "255.255.255.255",
+        ] {
+            config.udp.public_ip = Some(ip.parse().unwrap());
+            assert!(config.validate().is_err(), "{ip}");
+        }
+        config.udp.public_ip = Some("192.0.2.8".parse().unwrap());
+        assert!(config.validate().is_ok());
     }
 
     #[test]

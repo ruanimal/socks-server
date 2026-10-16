@@ -22,6 +22,8 @@ use tracing::{field, info, info_span, warn, Instrument};
 
 use crate::config::Config;
 
+mod udp;
+
 /// Serve until shutdown resolves, then drain existing connections for the configured grace period.
 pub async fn run_until(
     listener: TcpListener,
@@ -35,7 +37,8 @@ pub async fn run_until(
     let mut tasks = JoinSet::new();
     let mut next_id = 0_u64;
     info!(event = "server_started", listen = %listener.local_addr()?, auth_enabled = config.auth.enabled,
-        ip_filter_enabled = config.ip_filter.enabled, max_connections = config.max_connections, "server listening");
+        ip_filter_enabled = config.ip_filter.enabled, udp_enabled = config.udp.enabled,
+        max_connections = config.max_connections, "server listening");
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
@@ -48,7 +51,8 @@ pub async fn run_until(
                 let (socket, peer) = accepted.context("accepting client connection")?;
                 next_id += 1;
                 let span = info_span!("connection", connection_id = next_id,
-                    client_ip = %peer.ip(), client_port = peer.port(), destination = field::Empty, username = field::Empty);
+                    client_ip = %peer.ip(), client_port = peer.port(), protocol = field::Empty,
+                    destination = field::Empty, username = field::Empty);
                 if !config.ip_filter.allows(peer.ip()) {
                     warn!(parent: &span, event = "connection_rejected", reason = "ip_denied", "client IP denied");
                     continue;
@@ -74,10 +78,12 @@ pub async fn run_until(
                     let elapsed_ms = started.elapsed().as_millis() as u64;
                     match result {
                         Ok(()) => info!(event = "connection_closed", outcome = "success", elapsed_ms,
-                            bytes_up = session.traffic.up, bytes_down = session.traffic.down, "connection closed"),
+                            bytes_up = session.traffic.up, bytes_down = session.traffic.down,
+                            packets_up = session.traffic.packets_up, packets_down = session.traffic.packets_down, "connection closed"),
                         Err(error) => warn!(event = "connection_closed", outcome = "failed", stage = session.stage,
                             error = %format!("{error:#}"), elapsed_ms, bytes_up = session.traffic.up,
-                            bytes_down = session.traffic.down, "connection failed"),
+                            bytes_down = session.traffic.down, packets_up = session.traffic.packets_up,
+                            packets_down = session.traffic.packets_down, "connection failed"),
                     }
                 }.instrument(span));
             }
@@ -117,6 +123,8 @@ struct Session {
 }
 
 async fn serve(socket: TcpStream, config: &Config, session: &mut Session) -> Result<()> {
+    let peer = socket.peer_addr()?;
+    let local = socket.local_addr()?;
     socket.set_nodelay(true)?;
     session.stage = "handshake";
     let (proto, command, destination) =
@@ -150,12 +158,21 @@ async fn serve(socket: TcpStream, config: &Config, session: &mut Session) -> Res
         .await
         .context("SOCKS5 handshake/request timed out")??;
 
-    tracing::Span::current().record("destination", field::display(&destination));
-    info!(event = "proxy_requested", command = ?command, "proxy requested");
+    if command == Socks5Command::UDPAssociate {
+        tracing::Span::current().record("protocol", "udp");
+        info!(event = "proxy_requested", command = ?command, client_hint = %destination, "UDP association requested");
+        if config.udp.enabled {
+            return udp::run(proto, &destination, peer, local, config, session).await;
+        }
+    } else {
+        tracing::Span::current().record("protocol", "tcp");
+        tracing::Span::current().record("destination", field::display(&destination));
+        info!(event = "proxy_requested", command = ?command, "proxy requested");
+    }
     if command != Socks5Command::TCPConnect {
         session.stage = "command";
         proto.reply_error(&ReplyError::CommandNotSupported).await?;
-        bail!("only TCP CONNECT is supported");
+        bail!("command is unsupported or UDP is disabled");
     }
 
     session.stage = "connect";
@@ -215,6 +232,8 @@ fn connect_reply(error: &io::Error) -> ReplyError {
 struct Traffic {
     up: u64,
     down: u64,
+    packets_up: u64,
+    packets_down: u64,
 }
 
 // Count only relay payload, excluding SOCKS5 negotiation. Counts survive errors and shutdown.

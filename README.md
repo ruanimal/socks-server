@@ -3,12 +3,13 @@
 基于 [fast-socks5](https://github.com/dizda/fast-socks5) 1.0.0 的 Rust SOCKS5 服务端。
 
 - TCP CONNECT：支持 IPv4、IPv6、域名解析和双向传输。
+- UDP ASSOCIATE：支持 IPv4、IPv6、域名目标，按 TCP 会话校验 UDP 客户端来源。
 - 用户名密码认证与客户端 IP 限制独立配置，可以任意组合。
 - IP 规则支持单个 IP 和 CIDR，拒绝规则优先，支持 IPv4 映射 IPv6 地址。
 - JSON / 文本连接日志，包含连接标识、来源、目标、结果、时长和流量。
 - 握手超时、目标连接超时、并发上限和优雅退出。
 
-当前不支持 UDP ASSOCIATE 和 BIND，收到这两种命令会返回 SOCKS5 `CommandNotSupported`。
+UDP 默认关闭，需要显式开启。当前不支持 BIND，收到该命令会返回 SOCKS5 `CommandNotSupported`。
 
 ## 启动
 
@@ -55,6 +56,9 @@ cargo run --release -- --config config.toml \
 | `connect_timeout_secs` | `--connect-timeout-secs SECONDS` |
 | `shutdown_timeout_secs` | `--shutdown-timeout-secs SECONDS` |
 | `max_connections` | `--max-connections COUNT` |
+| `udp.enabled` | `--udp-enabled[=true\|false]` |
+| `udp.public_ip` | `--udp-public-ip IP` |
+| `udp.idle_timeout_secs` | `--udp-idle-timeout-secs SECONDS`（默认 60） |
 | `auth.enabled` | `--auth-enabled[=true\|false]` |
 | `auth.username` | `-u, --username USERNAME` |
 | `auth.password` | `-p, --password PASSWORD` |
@@ -125,6 +129,32 @@ curl --proxy socks5h://127.0.0.1:1080 --proxy-user proxy https://example.com
 
 `socks5h` 让服务端解析目标域名。
 
+## UDP 转发
+
+```sh
+cargo run --release -- -l 0.0.0.0:1080 \
+  --auth-enabled -u proxy --password-env SOCKS_PASSWORD --udp-enabled
+```
+
+也可以通过配置文件启用，命令行仍优先于配置文件：
+
+```toml
+[udp]
+enabled = true
+idle_timeout_secs = 60
+# public_ip = "203.0.113.10"
+```
+
+客户端必须支持 SOCKS5 `UDP ASSOCIATE`：先通过 TCP 完成认证和关联请求，按回复的 IP/端口发送带 SOCKS5 UDP 头的数据报，并保持 TCP 控制连接。普通 curl HTTP 请求只验证 TCP，不能验证 UDP 转发。
+
+每个关联使用一个独立的随机 UDP 中继端口。默认绑定并通告当前 TCP 连接对应的服务端 IP，不会返回 `0.0.0.0` 或 `::`。直连部署需允许这些 UDP 端口通过防火墙；NAT / 容器部署可用 `--udp-public-ip` 指定客户端可达的外部 IP，并保证随机中继端口的内外映射一致。该选项只修改通告 IP，不会自动设置端口映射，也不会将 UDP 固定到 TCP 监听端口。通告 IP 必须与该连接的服务端地址使用相同地址族。
+
+密码认证和 IP 限制沿用 TCP 会话的独立配置。UDP 只接受与已通过检查的 TCP 对端 IP 相同的来源。如果关联请求指定了非零 UDP 源端口，就严格检查该端口；端口为 0 时，锁定首个合法、未分片数据包的来源端口。之后其他端口无法接管该关联。经过 NAT 时，非零源端口应填写 NAT 后的端口；未知时填写 0。
+
+一个关联可以访问多个目标；回包只允许来自该关联已经成功发送过数据的目标 IP/端口。每个关联最多记录 1024 个目标，记录在最后一次向该目标发送后经过 `idle_timeout_secs` 失效。域名由服务端异步解析，使用解析结果中首个可成功发送的地址；UDP 发送成功不保证目标收到数据。
+
+TCP 控制连接关闭时立即释放 UDP 资源；持续无成功转发超过 `idle_timeout_secs` 时也会关闭关联。畸形包、未知来源和不支持的 SOCKS 分片（`FRAG != 0`）会被丢弃，且不刷新空闲计时。这里只处理完整 UDP 数据报，不实现 SOCKS 分片重组。服务停止时，UDP 会话使用同样的优雅退出期限。
+
 ## 连接日志
 
 默认以文本输出到 stderr，可直接交给 systemd / 容器收集，或重定向保存；设置 `--log-format json` 或配置 `format = "json"` 则使用 JSON Lines：
@@ -148,11 +178,16 @@ level = "info"
 | `authentication_succeeded` / `authentication_rejected` | 密码认证结果 |
 | `proxy_requested` | 请求命令和目标地址 |
 | `proxy_connected` | 已连接目标，含实际 `upstream` 地址 |
+| `udp_associated` | UDP 中继的绑定地址、通告地址及请求源端口 |
+| `udp_client_bound` | 从首个合法数据包确定的客户端 UDP 地址 |
+| `udp_destination` | 本次关联首次使用的目标，含目标域名/IP 与实际 `upstream` |
 | `connection_closed` | `outcome`、`elapsed_ms`、`bytes_up`、`bytes_down`；失败时含 `stage` 和 `error` |
 
-每个连接事件的 JSON `span` 带有 `connection_id`、`client_ip`、`client_port`，在认证和读取请求后补充 `username`、`destination`。连接 ID 在单次服务进程内唯一。日志不记录密码或代理内容；上游库日志始终关闭，因为其 debug 日志包含密码字节。通过配置文件或 `--log-level` 设置日志级别，`RUST_LOG` 不生效。
+每个连接事件的 JSON `span` 带有 `connection_id`、`client_ip`、`client_port`，在认证和读取请求后补充 `username`、`protocol`（`tcp` / `udp`）和 TCP 的 `destination`。UDP 的每个目标记录在 `udp_destination` 事件中；UDP ASSOCIATE 请求中的地址是客户端来源提示，单独记录为 `client_hint`。连接 ID 在单次服务进程内唯一。日志不记录密码或代理内容；上游库日志始终关闭，因为其 debug 日志包含密码字节。通过配置文件或 `--log-level` 设置日志级别，`RUST_LOG` 不生效。
 
 默认 `info` 记录完整连接生命周期；`warn` / `error` 会过滤较低级别事件。流量只统计代理阶段：`bytes_up` 为从客户端读取的字节数，`bytes_down` 为写回客户端的字节数，不含 SOCKS5 握手。传输异常时，上行可能包含尚未成功写入目标的缓冲数据。未进入代理阶段的流量为 0。日志文件轮转由运行环境负责。
+
+UDP 的字节计数仅包含成功发送的应用载荷，不含 SOCKS5 UDP 头；`packets_up` / `packets_down` 记录成功发送的数据报数量（空数据报也计数，TCP 这两项为 0）。每个数据报的收发及丢弃原因以 debug 事件记录，默认 info 不逐包输出。
 
 ## 资源与退出
 
@@ -168,4 +203,4 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-测试使用本机 loopback，不依赖公网目标，覆盖认证/IP 开关四种组合、IPv4/IPv6/CIDR、拒绝优先级、认证失败、握手超时、并发限制、域名解析、半关闭、失败回复、退出，以及真实进程的连接日志与密码屏蔽。
+测试使用本机 loopback，不依赖公网目标，覆盖认证/IP 开关四种组合、IPv4/IPv6/CIDR、拒绝优先级、认证失败、握手超时、并发限制、域名解析、半关闭、失败回复、退出，以及真实进程的连接日志与密码屏蔽。UDP 还覆盖多目标、空数据报、大报文、来源限制、端口锁定、未知回包、无效头/分片、控制连接生命周期、空闲超时及对外 IP。

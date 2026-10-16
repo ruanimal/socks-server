@@ -21,6 +21,13 @@ enabled = false
 allow = ["127.0.0.1", "::1"]
 deny = []
 
+[udp]
+enabled = false # --udp-enabled 开启 SOCKS5 UDP ASSOCIATE
+idle_timeout_secs = 60 # 仅成功转发的数据包刷新空闲计时
+# 默认向客户端返回 TCP 连接对应的服务端 IP。
+# NAT 部署可通过 public_ip 指定外部 IP；需保持 UDP 中继端口的内外映射一致。
+# public_ip = "203.0.113.10"
+
 [logging]
 format = "text" # 默认 text，可选 json；输出到 stderr
 level = "info"  # error、warn、info、debug、trace

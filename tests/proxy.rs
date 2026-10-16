@@ -3,13 +3,14 @@ use std::{
     time::Duration,
 };
 
+use fast_socks5::{new_udp_header, parse_udp_request, util::target_addr::TargetAddr};
 use socks_server::{
     config::{Config, IpRule},
     server::run_until,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpStream, UdpSocket},
     sync::oneshot,
     task::JoinHandle,
     time::timeout,
@@ -99,6 +100,15 @@ async fn authenticate(client: &mut TcpStream, auth: bool, password: &str) {
 }
 
 async fn request(client: &mut TcpStream, command: u8, target: SocketAddr, domain: bool) -> u8 {
+    request_reply(client, command, target, domain).await.0
+}
+
+async fn request_reply(
+    client: &mut TcpStream,
+    command: u8,
+    target: SocketAddr,
+    domain: bool,
+) -> (u8, SocketAddr) {
     let mut bytes = vec![5, command, 0];
     if domain {
         bytes.extend([3, 9]);
@@ -120,16 +130,262 @@ async fn request(client: &mut TcpStream, command: u8, target: SocketAddr, domain
     let header = read::<4>(client).await;
     assert_eq!(header[0], 5);
     assert_eq!(header[2], 0);
-    match header[3] {
+    let address = match header[3] {
         1 => {
-            read::<6>(client).await;
+            let bytes = read::<6>(client).await;
+            SocketAddr::new(
+                IpAddr::V4([bytes[0], bytes[1], bytes[2], bytes[3]].into()),
+                u16::from_be_bytes([bytes[4], bytes[5]]),
+            )
         }
         4 => {
-            read::<18>(client).await;
+            let bytes = read::<18>(client).await;
+            let ip: [u8; 16] = bytes[..16].try_into().unwrap();
+            SocketAddr::new(
+                IpAddr::V6(ip.into()),
+                u16::from_be_bytes([bytes[16], bytes[17]]),
+            )
         }
         _ => panic!("unexpected reply address type"),
+    };
+    (header[1], address)
+}
+
+async fn associate(server: &Server, auth: bool, port: u16) -> (TcpStream, SocketAddr) {
+    let mut control = TcpStream::connect(server.addr).await.unwrap();
+    authenticate(&mut control, auth, "very-secret-test-password").await;
+    let hint = SocketAddr::new(server.addr.ip(), port);
+    let (reply, relay) = request_reply(&mut control, 3, hint, false).await;
+    assert_eq!(reply, 0);
+    assert!(!relay.ip().is_unspecified());
+    assert_ne!(relay.port(), 0);
+    (control, relay)
+}
+
+async fn udp_echo(address: &str) -> (SocketAddr, JoinHandle<()>) {
+    let socket = UdpSocket::bind(address).await.unwrap();
+    socket2::SockRef::from(&socket)
+        .set_send_buffer_size(131_070)
+        .unwrap();
+    socket2::SockRef::from(&socket)
+        .set_recv_buffer_size(262_140)
+        .unwrap();
+    let address = socket.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut buffer = vec![0; 65_535];
+        loop {
+            let (size, source) = socket.recv_from(&mut buffer).await.unwrap();
+            socket.send_to(&buffer[..size], source).await.unwrap();
+        }
+    });
+    (address, task)
+}
+
+async fn udp_send(socket: &UdpSocket, relay: SocketAddr, destination: TargetAddr, payload: &[u8]) {
+    socket2::SockRef::from(socket)
+        .set_send_buffer_size(131_070)
+        .unwrap();
+    socket2::SockRef::from(socket)
+        .set_recv_buffer_size(262_140)
+        .unwrap();
+    let mut packet = new_udp_header(destination).unwrap();
+    packet.extend_from_slice(payload);
+    socket.send_to(&packet, relay).await.unwrap();
+}
+
+async fn udp_recv(socket: &UdpSocket, relay: SocketAddr) -> (TargetAddr, Vec<u8>) {
+    let mut buffer = vec![0; 65_535];
+    let (size, source) = timeout(Duration::from_secs(3), socket.recv_from(&mut buffer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(source, relay);
+    let (fragment, source, payload) = parse_udp_request(&buffer[..size]).await.unwrap();
+    assert_eq!(fragment, 0);
+    (source, payload.to_vec())
+}
+
+async fn udp_quiet(socket: &UdpSocket) {
+    assert!(
+        timeout(
+            Duration::from_millis(150),
+            socket.recv_from(&mut [0; 65_535])
+        )
+        .await
+        .is_err(),
+        "unexpected UDP packet"
+    );
+}
+
+#[tokio::test]
+async fn udp_respects_all_four_auth_and_ip_filter_combinations_and_large_payloads() {
+    for auth in [false, true] {
+        for filter in [false, true] {
+            let mut config = config(auth, filter);
+            config.udp.enabled = true;
+            let server = Server::start(config).await;
+            let (control, relay) = associate(&server, auth, 0).await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (target, echo_task) = udp_echo("127.0.0.1:0").await;
+            for payload in [vec![], b"UDP payload".to_vec(), vec![42; 32_000]] {
+                udp_send(&client, relay, TargetAddr::Ip(target), &payload).await;
+                let (source, received) = udp_recv(&client, relay).await;
+                assert_eq!(source, TargetAddr::Ip(target));
+                assert_eq!(received, payload);
+            }
+            drop(control);
+            server.stop().await;
+            echo_task.abort();
+        }
     }
-    header[1]
+}
+
+#[tokio::test]
+async fn udp_ipv6_and_domains_work_in_the_same_association() {
+    let mut config = config(false, true);
+    config.udp.enabled = true;
+    config.listen = "[::1]:0".parse().unwrap();
+    let server = Server::start(config).await;
+    let (control, relay) = associate(&server, false, 0).await;
+    let client = UdpSocket::bind("[::1]:0").await.unwrap();
+    for address in ["127.0.0.1:0", "[::1]:0", "localhost:0"] {
+        let (target, echo_task) = udp_echo(address).await;
+        let destination = if address == "localhost:0" {
+            TargetAddr::Domain("localhost".into(), target.port())
+        } else {
+            TargetAddr::Ip(target)
+        };
+        udp_send(&client, relay, destination, b"v4/v6/domain").await;
+        let (source, payload) = udp_recv(&client, relay).await;
+        assert_eq!(source, TargetAddr::Ip(target));
+        assert_eq!(payload, b"v4/v6/domain");
+        echo_task.abort();
+    }
+    drop(control);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn udp_malformed_and_fragmented_packets_do_not_claim_the_client_port() {
+    let mut config = config(false, false);
+    config.udp.enabled = true;
+    let server = Server::start(config).await;
+    let (control, relay) = associate(&server, false, 0).await;
+    let malformed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (target, echo_task) = udp_echo("127.0.0.1:0").await;
+    let mut fragment = new_udp_header(target).unwrap();
+    fragment[2] = 1;
+    fragment.extend(b"fragment");
+    let mut bad_reserved = new_udp_header(target).unwrap();
+    bad_reserved[0] = 1;
+    for packet in [
+        vec![],
+        vec![0, 0, 0, 1],
+        vec![0, 0, 0, 255],
+        bad_reserved,
+        fragment,
+    ] {
+        malformed.send_to(&packet, relay).await.unwrap();
+    }
+    udp_quiet(&malformed).await;
+    udp_send(&client, relay, TargetAddr::Ip(target), b"valid").await;
+    assert_eq!(udp_recv(&client, relay).await.1, b"valid");
+    // A second socket on the same IP cannot take over after the first valid packet.
+    udp_send(&malformed, relay, TargetAddr::Ip(target), b"takeover").await;
+    udp_quiet(&malformed).await;
+    udp_send(&client, relay, TargetAddr::Ip(target), b"still-bound").await;
+    assert_eq!(udp_recv(&client, relay).await.1, b"still-bound");
+    drop(control);
+    server.stop().await;
+    echo_task.abort();
+}
+
+#[tokio::test]
+async fn udp_honors_requested_source_port_and_drops_unsolicited_upstream_packets() {
+    let mut config = config(true, true);
+    config.udp.enabled = true;
+    let server = Server::start(config).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let rogue = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let destination = TargetAddr::Ip(target.local_addr().unwrap());
+    let (control, relay) = associate(&server, true, client.local_addr().unwrap().port()).await;
+    udp_send(&rogue, relay, destination.clone(), b"wrong-port").await;
+    udp_quiet(&target).await;
+    udp_send(&client, relay, destination, b"request").await;
+    let mut buffer = [0; 100];
+    let (size, outbound) = timeout(Duration::from_secs(3), target.recv_from(&mut buffer))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buffer[..size], b"request");
+    rogue.send_to(b"unsolicited", outbound).await.unwrap();
+    udp_quiet(&client).await;
+    target.send_to(b"real-response", outbound).await.unwrap();
+    assert_eq!(udp_recv(&client, relay).await.1, b"real-response");
+    drop(control);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn udp_control_close_idle_timeout_and_server_shutdown_release_the_relay() {
+    for mode in ["control", "idle", "shutdown"] {
+        let mut config = config(false, false);
+        config.udp.enabled = true;
+        config.udp.idle_timeout_secs = 1;
+        let server = Server::start(config).await;
+        let (mut control, relay) = associate(&server, false, 0).await;
+        match mode {
+            "control" => {
+                control.shutdown().await.unwrap();
+                closed(&mut control).await;
+                server.stop().await;
+            }
+            "idle" => {
+                closed(&mut control).await;
+                server.stop().await;
+            }
+            "shutdown" => {
+                server.stop().await;
+                closed(&mut control).await;
+            }
+            _ => unreachable!(),
+        }
+        timeout(Duration::from_secs(1), async {
+            loop {
+                match UdpSocket::bind(relay).await {
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                        tokio::time::sleep(Duration::from_millis(10)).await
+                    }
+                    Err(error) => panic!("cannot rebind released relay: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn udp_public_ip_is_advertised_and_mismatched_address_family_is_rejected() {
+    for (ip, expected) in [("192.0.2.8", 0), ("::1", 8)] {
+        let mut config = config(false, false);
+        config.udp.enabled = true;
+        config.udp.public_ip = Some(ip.parse().unwrap());
+        let server = Server::start(config).await;
+        let mut control = TcpStream::connect(server.addr).await.unwrap();
+        authenticate(&mut control, false, "").await;
+        let (reply, relay) =
+            request_reply(&mut control, 3, "0.0.0.0:0".parse().unwrap(), false).await;
+        assert_eq!(reply, expected);
+        if reply == 0 {
+            assert_eq!(relay.ip(), ip.parse::<IpAddr>().unwrap());
+        }
+        drop(control);
+        server.stop().await;
+    }
 }
 
 async fn echo_server(address: &str) -> (SocketAddr, JoinHandle<()>) {
@@ -421,6 +677,67 @@ allow = []
         .unwrap();
     let mut client = TcpStream::connect(address).await.unwrap();
     authenticate(&mut client, false, "").await;
+}
+
+#[tokio::test]
+async fn binary_udp_cli_and_logs_include_destinations_and_payload_packet_counts() {
+    let mut binary = Binary::start_with(
+        r#"
+listen = "127.0.0.1:0"
+[auth]
+enabled = true
+username = "tester"
+password_env = "SOCKS_SERVER_TEST_PASSWORD"
+[udp]
+enabled = false
+idle_timeout_secs = 0
+public_ip = "::1"
+"#,
+        &[
+            "--udp-enabled",
+            "--udp-idle-timeout-secs",
+            "10",
+            "--udp-public-ip",
+            "127.0.0.1",
+            "--log-format",
+            "json",
+        ],
+    );
+    let started = binary.event("server_started");
+    assert_eq!(started["fields"]["udp_enabled"], true);
+    let address: SocketAddr = started["fields"]["listen"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut control = TcpStream::connect(address).await.unwrap();
+    authenticate(&mut control, true, "very-secret-test-password").await;
+    let (reply, relay) = request_reply(&mut control, 3, "0.0.0.0:0".parse().unwrap(), false).await;
+    assert_eq!(reply, 0);
+    assert_eq!(
+        binary.event("udp_associated")["fields"]["advertised"],
+        relay.to_string()
+    );
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (target, echo_task) = udp_echo("127.0.0.1:0").await;
+    for payload in [b"udp-payload".as_slice(), b"", b"response"] {
+        udp_send(&client, relay, TargetAddr::Ip(target), payload).await;
+        assert_eq!(udp_recv(&client, relay).await.1, payload);
+    }
+    let destination = binary.event("udp_destination");
+    assert_eq!(destination["fields"]["destination"], target.to_string());
+    control.shutdown().await.unwrap();
+    let closed = binary.event("connection_closed");
+    assert_eq!(closed["span"]["protocol"], "udp");
+    assert_eq!(closed["span"]["username"], "tester");
+    assert_eq!(closed["fields"]["outcome"], "success");
+    assert_eq!(closed["fields"]["bytes_up"], b"udp-payloadresponse".len());
+    assert_eq!(closed["fields"]["bytes_down"], closed["fields"]["bytes_up"]);
+    assert_eq!(closed["fields"]["packets_up"], 3);
+    assert_eq!(closed["fields"]["packets_down"], 3);
+    assert!(!binary.output.contains("very-secret-test-password"));
+    assert!(!binary.output.contains("udp-payload"));
+    echo_task.abort();
 }
 
 #[test]

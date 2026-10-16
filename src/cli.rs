@@ -1,6 +1,6 @@
 use std::{
     io,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
 };
 
@@ -39,6 +39,15 @@ pub struct Args {
     /// Maximum concurrent client connections
     #[arg(long)]
     max_connections: Option<usize>,
+    /// Enable or disable UDP ASSOCIATE (bare flag means true; default: false)
+    #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    udp_enabled: Option<bool>,
+    /// Advertised UDP relay IP, e.g. the server's public IP behind NAT
+    #[arg(long)]
+    udp_public_ip: Option<IpAddr>,
+    /// UDP association idle timeout in seconds (default: 60)
+    #[arg(long)]
+    udp_idle_timeout_secs: Option<u64>,
     /// Enable or disable username/password authentication (bare flag means true)
     #[arg(long, action = ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     auth_enabled: Option<bool>,
@@ -114,6 +123,15 @@ impl Args {
         if let Some(value) = self.max_connections {
             config.max_connections = value;
         }
+        if let Some(value) = self.udp_enabled {
+            config.udp.enabled = value;
+        }
+        if let Some(value) = self.udp_public_ip {
+            config.udp.public_ip = Some(value);
+        }
+        if let Some(value) = self.udp_idle_timeout_secs {
+            config.udp.idle_timeout_secs = value;
+        }
         if let Some(value) = self.auth_enabled {
             config.auth.enabled = value;
         }
@@ -168,6 +186,8 @@ mod tests {
         let config = args(&[]).load_with_default(&path).unwrap();
         assert_eq!(config.listen, Config::default().listen);
         assert!(matches!(config.logging.format, LogFormat::Text));
+        assert!(!config.udp.enabled);
+        assert_eq!(config.udp.idle_timeout_secs, 60);
         std::fs::write(&path, "listen = '127.0.0.1:9000'\n[auth]\nenabled = true\nusername = 'file-user'\npassword = 'file-password'\n[ip_filter]\nenabled = true\nallow = ['::1']").unwrap();
         let config = args(&[]).load_with_default(&path).unwrap();
         assert_eq!(config.listen.port(), 9000);
@@ -194,6 +214,11 @@ mod tests {
             "0",
             "--max-connections",
             "20",
+            "--udp-enabled",
+            "--udp-public-ip",
+            "192.0.2.8",
+            "--udp-idle-timeout-secs",
+            "30",
             "-u",
             "cli-user",
             "-p",
@@ -210,6 +235,9 @@ mod tests {
         assert_eq!(config.connect_timeout_secs, 6);
         assert_eq!(config.shutdown_timeout_secs, 0);
         assert_eq!(config.max_connections, 20);
+        assert!(config.udp.enabled);
+        assert_eq!(config.udp.public_ip, Some("192.0.2.8".parse().unwrap()));
+        assert_eq!(config.udp.idle_timeout_secs, 30);
         assert!(config.auth.accepts("cli-user", "cli-password"));
         assert!(config.auth.password_env.is_none());
         assert!(matches!(config.logging.format, LogFormat::Json));
@@ -219,12 +247,20 @@ mod tests {
     #[test]
     fn cli_boolean_values_can_enable_and_disable_independently() {
         let mut config = Config::default();
-        args(&["--auth-enabled", "--ip-filter-enabled=false"]).apply(&mut config);
+        args(&[
+            "--auth-enabled",
+            "--ip-filter-enabled=false",
+            "--udp-enabled",
+        ])
+        .apply(&mut config);
         assert!(config.auth.enabled);
         assert!(!config.ip_filter.enabled);
+        assert!(config.udp.enabled);
         args(&["--auth-enabled", "false", "--ip-filter-enabled", "true"]).apply(&mut config);
         assert!(!config.auth.enabled);
         assert!(config.ip_filter.enabled);
+        args(&["--udp-enabled=false"]).apply(&mut config);
+        assert!(!config.udp.enabled);
     }
 
     #[test]
