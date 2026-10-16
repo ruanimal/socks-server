@@ -1,0 +1,23 @@
+[package]
+name = "socks-server"
+version = "0.1.0"
+edition = "2021"
+description = "SOCKS5 server with independent password authentication, IP filtering, and connection logs"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+fast-socks5 = "=1.0.0"
+ipnet = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+subtle = "2"
+tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macros", "signal", "sync", "time"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+

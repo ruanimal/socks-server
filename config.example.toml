@@ -1,0 +1,26 @@
+# 默认只监听本机。对外服务时可改成 "0.0.0.0:1080" 或 "[::]:1080"。
+listen = "127.0.0.1:1080"
+handshake_timeout_secs = 10
+connect_timeout_secs = 10
+shutdown_timeout_secs = 30
+max_connections = 1024
+
+# 与 ip_filter 独立；启用后仅接受 SOCKS5 用户名密码认证。
+[auth]
+enabled = false
+# username = "proxy"
+# password = "change-me"
+# 也可以配置 password_env 从环境变量读取，不能同时设置 password。
+# password_env = "SOCKS_PASSWORD"
+
+[ip_filter]
+enabled = false
+# 启用后：deny 优先；allow 为空时拒绝所有来源。
+# 单 IP、IPv4/IPv6 CIDR 均可；规则匹配客户端的 TCP 来源地址。
+allow = ["127.0.0.1", "::1"]
+deny = []
+
+[logging]
+format = "json" # json 或 text；输出到 stderr
+level = "info"  # error、warn、info、debug、trace
+
