@@ -1,28 +1,15 @@
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
-
 use anyhow::{Context, Result};
 use clap::Parser;
-use socks_server::config::{Config, LogFormat};
+use socks_server::{cli::Args, config::LogFormat};
 use tokio::net::TcpListener;
 use tracing_subscriber::{filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt, Layer};
-
-#[derive(Parser)]
-#[command(version, about)]
-struct Args {
-    /// TOML configuration file
-    #[arg(short, long, default_value = "config.toml")]
-    config: PathBuf,
-    /// Validate configuration and exit
-    #[arg(long)]
-    check: bool,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let config = Config::load(&args.config)?;
+    let config = args.load_config()?;
     if args.check {
         println!("configuration valid");
         return Ok(());

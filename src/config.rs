@@ -39,18 +39,25 @@ impl Default for Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
+        Self::read(path)?.finish()
+    }
+
+    pub(crate) fn read(path: &Path) -> Result<Self> {
         let source = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read config {}", path.display()))?;
         // TOML errors can include the source line, which could contain a password.
-        let mut config: Self = toml::from_str(&source).map_err(|error| {
+        toml::from_str(&source).map_err(|error| {
             anyhow::anyhow!(
                 "invalid TOML config (check field names and value types), byte range {:?}",
                 error.span()
             )
-        })?;
-        config.resolve_password()?;
-        config.validate()?;
-        Ok(config)
+        })
+    }
+
+    pub(crate) fn finish(mut self) -> Result<Self> {
+        self.resolve_password()?;
+        self.validate()?;
+        Ok(self)
     }
 
     fn resolve_password(&mut self) -> Result<()> {
@@ -125,11 +132,25 @@ pub struct IpFilter {
     pub deny: Vec<IpRule>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(untagged)]
 pub enum IpRule {
     Address(IpAddr),
     Network(IpNet),
+}
+
+impl std::str::FromStr for IpRule {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Ok(ip) = value.parse::<IpAddr>() {
+            return Ok(Self::Address(ip));
+        }
+        value
+            .parse::<IpNet>()
+            .map(Self::Network)
+            .map_err(|_| "expected an IPv4/IPv6 address or CIDR network".into())
+    }
 }
 
 impl IpRule {
@@ -173,7 +194,7 @@ pub struct Logging {
 impl Default for Logging {
     fn default() -> Self {
         Self {
-            format: LogFormat::Json,
+            format: LogFormat::Text,
             level: "info".into(),
         }
     }
@@ -187,7 +208,7 @@ impl Logging {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
     Json,

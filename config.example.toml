@@ -1,3 +1,4 @@
+# 所有配置项均可通过命令行覆盖；命令行 > 配置文件 > 默认值，详见 --help。
 # 默认只监听本机。对外服务时可改成 "0.0.0.0:1080" 或 "[::]:1080"。
 listen = "127.0.0.1:1080"
 handshake_timeout_secs = 10
@@ -21,6 +22,6 @@ allow = ["127.0.0.1", "::1"]
 deny = []
 
 [logging]
-format = "json" # json 或 text；输出到 stderr
+format = "text" # 默认 text，可选 json；输出到 stderr
 level = "info"  # error、warn、info、debug、trace
 

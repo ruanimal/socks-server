@@ -274,11 +274,7 @@ struct Binary {
 
 impl Binary {
     fn start() -> Self {
-        use std::io::BufRead;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(
-            &path,
+        Self::start_with(
             r#"
 listen = "127.0.0.1:0"
 [auth]
@@ -286,12 +282,21 @@ enabled = true
 username = "tester"
 password_env = "SOCKS_SERVER_TEST_PASSWORD"
 [logging]
+format = "json"
 level = "trace"
 "#,
+            &[],
         )
-        .unwrap();
+    }
+
+    fn start_with(source: &str, options: &[&str]) -> Self {
+        use std::io::BufRead;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, source).unwrap();
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_socks-server"))
             .args(["--config", path.to_str().unwrap()])
+            .args(options)
             .env("SOCKS_SERVER_TEST_PASSWORD", "very-secret-test-password")
             .env("RUST_LOG", "trace,fast_socks5=trace")
             .stderr(std::process::Stdio::piped())
@@ -330,6 +335,111 @@ level = "trace"
             }
         }
     }
+}
+
+#[tokio::test]
+async fn binary_cli_overrides_listener_credentials_ip_rules_and_logging() {
+    let mut binary = Binary::start_with(
+        r#"
+listen = "192.0.2.1:1080"
+[auth]
+enabled = false
+username = "file-user"
+password = "file-password"
+[ip_filter]
+enabled = false
+allow = []
+deny = ["127.0.0.1"]
+[logging]
+format = "text"
+level = "off"
+"#,
+        &[
+            "--listen",
+            "127.0.0.1:0",
+            "--auth-enabled",
+            "--username",
+            "tester",
+            "--password-env",
+            "SOCKS_SERVER_TEST_PASSWORD",
+            "--ip-filter-enabled",
+            "--allow",
+            "127.0.0.1,::1",
+            "--clear-deny",
+            "--log-format",
+            "json",
+            "--log-level",
+            "info",
+        ],
+    );
+    let started = binary.event("server_started");
+    assert_eq!(started["fields"]["auth_enabled"], true);
+    assert_eq!(started["fields"]["ip_filter_enabled"], true);
+    let address: SocketAddr = started["fields"]["listen"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (target, echo_task) = echo_server("127.0.0.1:0").await;
+    let mut client = TcpStream::connect(address).await.unwrap();
+    authenticate(&mut client, true, "very-secret-test-password").await;
+    assert_eq!(request(&mut client, 1, target, false).await, 0);
+    echo(&mut client).await;
+    echo_task.await.unwrap();
+    assert_eq!(
+        binary.event("connection_closed")["fields"]["outcome"],
+        "success"
+    );
+}
+
+#[tokio::test]
+async fn binary_cli_can_disable_both_configured_restrictions() {
+    let mut binary = Binary::start_with(
+        r#"
+listen = "127.0.0.1:0"
+[auth]
+enabled = true
+password_env = "SOCKS_SERVER_TEST_MISSING_6F5A"
+[ip_filter]
+enabled = true
+allow = []
+"#,
+        &[
+            "--auth-enabled=false",
+            "--ip-filter-enabled=false",
+            "--log-format",
+            "json",
+        ],
+    );
+    let started = binary.event("server_started");
+    assert_eq!(started["fields"]["auth_enabled"], false);
+    assert_eq!(started["fields"]["ip_filter_enabled"], false);
+    let address: SocketAddr = started["fields"]["listen"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let mut client = TcpStream::connect(address).await.unwrap();
+    authenticate(&mut client, false, "").await;
+}
+
+#[test]
+fn binary_cli_only_mode_works_and_explicit_missing_config_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let run = |options: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_socks-server"))
+            .current_dir(dir.path())
+            .args(options)
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["--listen", "127.0.0.1:9000", "--check"])
+        .status
+        .success());
+    assert!(!run(&["--config", "missing.toml", "--check"])
+        .status
+        .success());
+    assert!(!run(&["--max-connections", "0", "--check"]).status.success());
 }
 
 impl Drop for Binary {
