@@ -193,7 +193,11 @@ UDP 的字节计数仅包含成功发送的应用载荷，不含 SOCKS5 UDP 头�
 
 顶层配置项：`handshake_timeout_secs`（认证及命令请求总时限，默认 10 秒）、`connect_timeout_secs`（DNS 解析与目标连接总时限，默认 10 秒）、`max_connections`（默认 1024）。超时不限制已建立隧道的持续时间。
 
-收到 Ctrl-C / SIGTERM 后停止接受新连接，等待现有连接结束；超过 `shutdown_timeout_secs`（默认 30 秒）后关闭剩余连接并记录日志。设为 0 则立即关闭。
+- **Ctrl-C / SIGINT**：停止接受新连接，立即关闭现有 TCP / UDP 会话，记录日志并退出。
+- **SIGTERM**：停止接受新连接，等待现有连接结束；超过 `shutdown_timeout_secs`（默认 30 秒）后关闭剩余连接。设为 0 则立即关闭。
+- SIGTERM 等待期间再次收到 SIGTERM 或 Ctrl-C，立即关闭剩余连接并退出。
+
+退出日志会标明退出模式、剩余连接数和等待期限。
 
 ## 开发检查
 

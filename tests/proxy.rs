@@ -591,6 +591,108 @@ level = "trace"
             }
         }
     }
+
+    #[cfg(unix)]
+    fn signal(&self, name: &str) {
+        let status = std::process::Command::new("kill")
+            .args([name, &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    async fn exited(&mut self) {
+        let status = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("server should exit promptly");
+        assert!(status.success(), "server exit: {status}");
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn binary_ctrl_c_exits_promptly_with_active_tcp_and_udp_connections() {
+    let mut binary = Binary::start_with(
+        "listen = '127.0.0.1:0'\nshutdown_timeout_secs = 30\n[udp]\nenabled = true\n[logging]\nformat = 'json'",
+        &[],
+    );
+    let started = binary.event("server_started");
+    let address: SocketAddr = started["fields"]["listen"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut tcp = TcpStream::connect(address).await.unwrap();
+    authenticate(&mut tcp, false, "").await;
+    assert_eq!(
+        request(&mut tcp, 1, upstream.local_addr().unwrap(), false).await,
+        0
+    );
+    let (_upstream, _) = upstream.accept().await.unwrap();
+    let mut udp_control = TcpStream::connect(address).await.unwrap();
+    authenticate(&mut udp_control, false, "").await;
+    let (reply, relay) =
+        request_reply(&mut udp_control, 3, "0.0.0.0:0".parse().unwrap(), false).await;
+    assert_eq!(reply, 0);
+    binary.event("udp_associated");
+    binary.signal("-INT");
+    binary.exited().await;
+    closed(&mut tcp).await;
+    closed(&mut udp_control).await;
+    let _released = UdpSocket::bind(relay).await.unwrap();
+    let stopped = binary.event("server_stopping");
+    assert_eq!(stopped["fields"]["mode"], "Immediate");
+    assert_eq!(stopped["fields"]["grace_period_secs"], 0);
+    binary.event("server_stopped");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn binary_sigterm_drains_and_a_second_signal_forces_exit() {
+    for second in [None, Some("-INT"), Some("-TERM")] {
+        let mut binary = Binary::start_with(
+            "listen = '127.0.0.1:0'\nshutdown_timeout_secs = 30\n[udp]\nenabled = true\n[logging]\nformat = 'json'",
+            &[],
+        );
+        let started = binary.event("server_started");
+        let address: SocketAddr = started["fields"]["listen"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut control = TcpStream::connect(address).await.unwrap();
+        authenticate(&mut control, false, "").await;
+        assert_eq!(
+            request(&mut control, 3, "0.0.0.0:0".parse().unwrap(), false).await,
+            0
+        );
+        binary.event("udp_associated");
+        binary.signal("-TERM");
+        let stopping = binary.event("server_stopping");
+        assert_eq!(stopping["fields"]["mode"], "Graceful");
+        assert_eq!(stopping["fields"]["grace_period_secs"], 30);
+        assert!(
+            binary.child.try_wait().unwrap().is_none(),
+            "first SIGTERM should drain active connections"
+        );
+        if let Some(signal) = second {
+            binary.signal(signal);
+        } else {
+            control.shutdown().await.unwrap();
+        }
+        binary.exited().await;
+        closed(&mut control).await;
+        binary.event("server_stopped");
+    }
 }
 
 #[tokio::test]

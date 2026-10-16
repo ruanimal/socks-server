@@ -3,6 +3,7 @@
 listen = "127.0.0.1:1080"
 handshake_timeout_secs = 10
 connect_timeout_secs = 10
+# SIGTERM 的优雅退出期限；Ctrl-C 始终立即关闭连接并退出。
 shutdown_timeout_secs = 30
 max_connections = 1024
 

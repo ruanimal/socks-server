@@ -14,7 +14,7 @@ use fast_socks5::{
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::{watch, Semaphore},
+    sync::{mpsc, watch, Semaphore},
     task::JoinSet,
     time::timeout,
 };
@@ -24,26 +24,49 @@ use crate::config::Config;
 
 mod udp;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shutdown {
+    Graceful,
+    Immediate,
+}
+
 /// Serve until shutdown resolves, then drain existing connections for the configured grace period.
 pub async fn run_until(
     listener: TcpListener,
     config: Config,
     shutdown: impl Future<Output = ()>,
 ) -> Result<()> {
+    let (sender, receiver) = mpsc::channel(1);
+    let server = run_with_shutdown(listener, config, receiver);
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        _ = shutdown => {
+            let _ = sender.send(Shutdown::Graceful).await;
+            server.await
+        }
+    }
+}
+
+/// Receive shutdown requests throughout the drain period, allowing a second request to force exit.
+pub async fn run_with_shutdown(
+    listener: TcpListener,
+    config: Config,
+    mut shutdown: mpsc::Receiver<Shutdown>,
+) -> Result<()> {
     config.validate()?;
     let config = Arc::new(config);
     let permits = Arc::new(Semaphore::new(config.max_connections));
-    let (force_shutdown, _) = watch::channel(false);
+    let (force_shutdown, _) = watch::channel(None);
     let mut tasks = JoinSet::new();
     let mut next_id = 0_u64;
     info!(event = "server_started", listen = %listener.local_addr()?, auth_enabled = config.auth.enabled,
         ip_filter_enabled = config.ip_filter.enabled, udp_enabled = config.udp.enabled,
         max_connections = config.max_connections, "server listening");
-    tokio::pin!(shutdown);
-    loop {
+    let mode = loop {
         tokio::select! {
             biased;
-            _ = &mut shutdown => break,
+            request = shutdown.recv() => break request.unwrap_or(Shutdown::Immediate),
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Err(error) = result { warn!(event = "connection_task_failed", %error); }
             }
@@ -72,7 +95,7 @@ pub async fn run_until(
                         result = serve(socket, &config, &mut session) => result,
                         _ = force.changed() => {
                             session.stage = "shutdown";
-                            Err(anyhow::anyhow!("shutdown grace period expired"))
+                            Err(anyhow::anyhow!(force.borrow().unwrap_or("server shutting down")))
                         }
                     };
                     let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -88,24 +111,34 @@ pub async fn run_until(
                 }.instrument(span));
             }
         }
-    }
+    };
     drop(listener);
     info!(
         event = "server_stopping",
         active_connections = tasks.len(),
-        "draining connections"
+        mode = ?mode,
+        grace_period_secs = if mode == Shutdown::Immediate { 0 } else { config.shutdown_timeout_secs },
+        "server stopping"
     );
-    if timeout(Duration::from_secs(config.shutdown_timeout_secs), async {
-        while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result {
-                warn!(event = "connection_task_failed", %error);
+    let force_reason = if mode == Shutdown::Immediate {
+        Some("immediate shutdown requested")
+    } else {
+        tokio::select! {
+            biased;
+            _ = shutdown.recv() => Some("shutdown interrupted by another request"),
+            result = timeout(Duration::from_secs(config.shutdown_timeout_secs), async {
+                while let Some(result) = tasks.join_next().await {
+                    if let Err(error) = result {
+                        warn!(event = "connection_task_failed", %error);
+                    }
+                }
+            }) => {
+                result.err().map(|_| "shutdown grace period expired")
             }
         }
-    })
-    .await
-    .is_err()
-    {
-        let _ = force_shutdown.send(true);
+    };
+    if let Some(reason) = force_reason {
+        let _ = force_shutdown.send(Some(reason));
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result {
                 warn!(event = "connection_task_failed", %error);
