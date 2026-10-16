@@ -1,0 +1,134 @@
+name: Build packages
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            host: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            host: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15-intel
+            host: x86_64-apple-darwin
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            host: aarch64-apple-darwin
+            target: aarch64-apple-darwin
+          - runner: windows-2025
+            host: x86_64-pc-windows-msvc
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            host: aarch64-pc-windows-msvc
+            target: aarch64-pc-windows-msvc
+    defaults:
+      run:
+        shell: bash
+    env:
+      TARGET: ${{ matrix.target }}
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable-${{ matrix.host }}
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+
+      - name: Check formatting and lint
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --target "$TARGET" --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked --release --target "$TARGET" --all-targets
+
+      - name: Build release binary
+        run: cargo build --locked --release --target "$TARGET"
+
+      - name: Verify static musl binary
+        if: runner.os == 'Linux'
+        run: |
+          binary="target/$TARGET/release/socks-server"
+          file "$binary"
+          if readelf --program-headers "$binary" | grep -q INTERP; then
+            echo "Unexpected ELF interpreter in musl binary" >&2
+            exit 1
+          fi
+          if readelf --dynamic "$binary" | grep -q NEEDED; then
+            echo "Unexpected dynamic dependency in musl binary" >&2
+            exit 1
+          fi
+
+      - name: Smoke test release binary
+        run: |
+          binary="target/$TARGET/release/socks-server"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            binary="$binary.exe"
+          fi
+          "$binary" --version
+          "$binary" --config config.example.toml --check
+
+      - name: Set up Python for packaging
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      - name: Package binary and calculate SHA256
+        id: package
+        run: python .github/scripts/package.py --target "$TARGET"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

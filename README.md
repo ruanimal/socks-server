@@ -27,6 +27,32 @@ cargo run --release -- --config config.toml
 cargo run -- --config config.toml --check
 ```
 
+## 构建与下载
+
+GitHub Actions 的 **Build packages** 工作流会在向 `main` / `master` 推送、创建 `v*` 标签、提交 PR 或手动触发时运行。在 Actions 对应运行页面的 **Artifacts** 区域下载目标平台的包。
+
+| 平台 | 架构 | Rust target | 包格式 |
+| --- | --- | --- | --- |
+| Linux musl | amd64 | `x86_64-unknown-linux-musl` | `.tar.gz` |
+| Linux musl | arm64 | `aarch64-unknown-linux-musl` | `.tar.gz` |
+| macOS | amd64 | `x86_64-apple-darwin` | `.tar.gz` |
+| macOS | arm64 | `aarch64-apple-darwin` | `.tar.gz` |
+| Windows | amd64 | `x86_64-pc-windows-msvc` | `.zip` |
+| Windows | arm64 | `aarch64-pc-windows-msvc` | `.zip` |
+
+六个目标均在对应架构的原生 runner 上测试和构建，使用 stable Rust 和 `Cargo.lock`。Linux 安装 musl 工具链，并检查成品不包含 ELF 动态解释器和动态库依赖；Windows 使用 MSVC。
+
+每个包包含 `socks-server`（Windows 为 `socks-server.exe`）、`config.example.toml` 和本 README，旁边附有 `.sha256` 校验文件。文件名包含 `Cargo.toml` 中的版本号和平台，例如 `socks-server-v0.1.0-linux-arm64-musl.tar.gz`。Actions 上传的外层压缩包解压后，再解压其中的平台包即可使用；构建产物保留 30 天。
+
+本机构建与打包示例（Apple Silicon）：
+
+```sh
+cargo build --locked --release --target aarch64-apple-darwin
+python3 .github/scripts/package.py --target aarch64-apple-darwin
+```
+
+打包脚本需要 Python 3.11+，产物写入 `dist/`。
+
 ## 命令行配置
 
 所有配置项都支持命令行，优先级为 **命令行 > 配置文件 > 默认值**。未显式指定 `--config` 时，会读取当前目录的 `config.toml`；若该文件不存在则使用默认值，可直接通过命令行启动。显式指定的文件不存在、不可读或内容有误时仍会报错。
